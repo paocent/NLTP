@@ -26,10 +26,13 @@ try:
     english_stopwords = set(stopwords.words('english'))
 
 
-    def custom_tokenizer(text):
+    def custom_tokenizer_clean(text):
         """ Cleans, tokenizes, removes stopwords, and lemmatizes text (Full NLTK version). """
+        # 1. Remove non-alphabetic characters
         text = re.sub(r'[^a-zA-Z\s]', '', text.lower())
+        # 2. Tokenize (split into words)
         tokens = nltk.word_tokenize(text)
+        # 3. Lemmatize, removing stopwords and short tokens
         lemmas = [
             lemmatizer.lemmatize(w)
             for w in tokens
@@ -55,7 +58,7 @@ except Exception:
     english_stopwords = set()  # Empty set for display purposes
 
 
-    def custom_tokenizer(text):
+    def custom_tokenizer_clean(text):
         """ Simplified tokenizer: lowercases, removes non-alphabetic chars, and splits into words. """
         text = re.sub(r'[^a-zA-Z\s]', '', text.lower())
         return [w for w in text.split() if len(w) > 2]
@@ -63,6 +66,73 @@ except Exception:
 
     def log_stopwords_in_data(data_series, stopwords_set):
         return Counter({'NLTK': 0})  # Dummy counter for compatibility
+
+
+# --------------------------------------------------
+# --- NEW: Feature Engineering for Spam Indicators (Links & HTML) ---
+
+def preprocess_for_spam_features(text):
+    """
+    Detects and tags links and HTML content before standard tokenization.
+    """
+
+    # 1. Detect and tag URLs/Links (http, https, www)
+    # Replaces the URL with a special tag
+    link_pattern = r'(http|www)\S+'
+    if re.search(link_pattern, text, re.IGNORECASE):
+        text = re.sub(link_pattern, '__HAS_LINK__', text)
+
+    # 2. Detect and tag HTML tags (<tag>...</tag> or just <a>)
+    # Replaces the HTML tag with a special tag
+    html_pattern = r'<[^>]+>'
+    if re.search(html_pattern, text):
+        text = re.sub(html_pattern, '__HAS_HTML__', text)
+
+    # Return the modified text for the standard tokenizer to handle the rest
+    return text
+
+
+def custom_tokenizer(text):
+    """
+    Combined tokenizer: applies spam feature detection first, then cleans and tokenizes.
+    """
+    # 1. Apply spam feature detection (links/html tags)
+    text = preprocess_for_spam_features(text)
+
+    # 2. Apply standard cleaning and tokenization
+    tokens = custom_tokenizer_clean(text)
+
+    # 3. Add the special tags as tokens if they were found and replaced
+    # We must ensure the special tags are included in the token list for CountVectorizer
+    if '__HAS_LINK__' in text:
+        tokens.append('__HAS_LINK__')
+    if '__HAS_HTML__' in text:
+        tokens.append('__HAS_HTML__')
+
+    return tokens
+
+
+# --- NEW: Feature Importance Function (Explanation) ---
+
+def get_top_spam_features(model, vectorizer, input_tfidf, top_n=5):
+    """
+    Identifies the top N words in the input that contribute most to the SPAM prediction.
+    """
+    spam_log_probs = model.feature_log_prob_[1]
+    input_indices = input_tfidf.nonzero()[1]
+
+    # Check if there are any features present in the input
+    if len(input_indices) == 0:
+        return pd.Series()
+
+    input_tfidf_scores = input_tfidf[0, input_indices].toarray().flatten()
+    feature_scores = input_tfidf_scores * spam_log_probs[input_indices]
+    feature_names = np.array(vectorizer.get_feature_names_out())[input_indices]
+    scored_features = pd.Series(feature_scores, index=feature_names)
+
+    # Sort and return the words that have the highest influence on the SPAM prediction
+    return scored_features.nlargest(top_n)
+
 
 # --------------------------------------------------
 
@@ -99,7 +169,8 @@ print("## ☁️ Focused Word Cloud (Ham-Only)")
 datasets_ham = datasets[datasets['class'] == 0]
 all_ham_words = []
 for comment in datasets_ham['content']:
-    all_ham_words.extend(custom_tokenizer(comment))
+    # Use the cleaning part of the tokenizer for the word cloud
+    all_ham_words.extend(custom_tokenizer_clean(comment))
 cleaned_ham_text = " ".join(all_ham_words)
 focused_wordcloud = WordCloud(width=800, height=400, background_color='white').generate(cleaned_ham_text)
 plt.figure(figsize=(10, 5))
@@ -132,6 +203,7 @@ print("-" * 30)
 
 # --- 2 & 3. Feature Engineering: CountVectorizer (Bag-of-Words) with Lemmatization ---
 print("## ⚙️ Feature Engineering (Bag-of-Words & Tokenization)")
+# NOTE: Using the new combined 'custom_tokenizer' here
 count_vectorizer = CountVectorizer(tokenizer=custom_tokenizer)
 X_counts = count_vectorizer.fit_transform(datasets['content'])
 print(f"New shape of the data after Bag-of-Words/Tokenization: **{X_counts.shape}**")
@@ -223,7 +295,7 @@ metrics = {
     'F1-Score': f1_score(y_test, y_pred, zero_division=0)
 }
 
-print("\n**Performance Metrics (Test Data):**")
+print("\n**Performance Metrics (Test Data):")
 for name, value in metrics.items():
     print(f"- {name}: **{value:.4f}**")
 
@@ -237,7 +309,7 @@ print(conf_matrix)
 
 print("\n## 📈 Performance Visualization")
 
-# --- 1. Confusion Matrix Heatmap (New Chart) ---
+# --- 1. Confusion Matrix Heatmap ---
 plt.figure(figsize=(6, 5))
 plt.imshow(conf_matrix, interpolation='nearest', cmap=plt.cm.Blues)
 plt.title('Confusion Matrix')
@@ -260,7 +332,7 @@ plt.xlabel('Predicted label')
 plt.tight_layout()
 plt.show()
 
-# --- 2. Metrics Bar Chart (Existing Chart) ---
+# --- 2. Metrics Bar Chart ---
 metric_names = list(metrics.keys())
 metric_values = list(metrics.values())
 
@@ -292,7 +364,7 @@ while True:
         print("\nExiting comment classification. Goodbye!")
         break
 
-    # 1. Vectorize the new text
+    # 1. Vectorize the new text (uses the new custom_tokenizer)
     new_counts = count_vectorizer.transform([user_input_comment])
 
     # 2. Transform the counts to TF-IDF weights
@@ -306,4 +378,25 @@ while True:
     print("\n--- CLASSIFICATION RESULT ---")
     print(f"Input Comment: '{user_input_comment}'")
     print(f"Predicted Class: {result_label}")
+
+    # 4. Feature Explanation
+    if new_prediction == 1:
+        # Only analyze if predicted as spam
+        top_features = get_top_spam_features(model, count_vectorizer, new_tfidf)
+        print("\n### 🚨 Reason for SPAM Detection (Top 5 Keywords):")
+        print(
+            "This classification is based on the following words/features having the highest weights for the SPAM class:")
+
+        if top_features.empty:
+            print("- The input comment contains no recognized features in the model's vocabulary.")
+        else:
+            for word, score in top_features.items():
+                # Highlight link/html feature
+                if word in ['__HAS_LINK__', '__HAS_HTML__']:
+                    display_word = f"**{word.replace('_', '')}**"
+                else:
+                    display_word = word.upper()
+
+                print(f"- {display_word} (Score: {score:.4f})")
+
     print("-----------------------------")
